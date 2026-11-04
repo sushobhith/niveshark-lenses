@@ -6,6 +6,9 @@
  *      the statement-date ("as on") cells;
  *   2. redact PAN, email, IFSC and DOB values in surviving rows;
  *   3. drop rows that start with a PII label, wherever they appear.
+ * Depository statements (D-051) use their own table-header boundary and,
+ * before rule 2, drop labelled DP ID / Client ID / BO ID / CAS ID rows and
+ * redact every learnt identifier and the investor's name in every row.
  *
  * Payload layer: `finaliseHoldings` hashes folios with the session salt
  * and drops client ids; `toPayloadHolding` copies only allowlisted fields;
@@ -51,6 +54,108 @@ const DATE_CELL_RE = /^\(?\s*\d{2}-[A-Za-z]{3}-\d{4}\s*\)?$/;
 /** A table header row: `Folio No.`, `Client Id` or `ISIN` together with `Scheme`. */
 export function isTableHeaderRow(row: TextRow): boolean {
   return /Folio No\.|Client Id|ISIN/.test(row.text) && /Scheme/.test(row.text);
+}
+
+/**
+ * A depository holdings-table header (D-051): `ISIN` with `Security` (demat
+ * table) or `Scheme Name` (folio table), and no colon. The colon rule keeps
+ * labelled lines such as "Scheme Name : … ISIN : …" in the per-folio
+ * descriptive blocks from ending the preamble early.
+ */
+export function isDepositoryTableHeaderRow(row: TextRow): boolean {
+  return /ISIN/.test(row.text) && /Security|Scheme Name/i.test(row.text) && !/:/.test(row.text);
+}
+
+function headerPredicate(source: StatementSource): (row: TextRow) => boolean {
+  return source === "depository" ? isDepositoryTableHeaderRow : isTableHeaderRow;
+}
+
+// ---------------------------------------------------------------------------
+// Depository identifiers (D-051, SB-14..SB-17)
+//
+// Patterns follow casparser 1.4.1 `parsers/cdsl.py` (`SUMMARY_DPC_RE`,
+// `SECTION_DPC_RE`, `SECTION_BOID_RE`, `PAN_RE`) and `parsers/_investor.py`
+// (`_ID_MARKER_RE`: the investor's name is the first line after "CAS ID :" /
+// "NSDL ID :"). The values are learnt from the unscrubbed rows of every page,
+// then redacted wherever they recur, so a copy after the first holdings table
+// (a second account header, a page banner, a footer) cannot survive.
+// ---------------------------------------------------------------------------
+
+const DP_ID_LEARN_RE = /\bDP\s*Id\s*:\s*([A-Z0-9]{4,})/gi;
+const CLIENT_ID_LEARN_RE = /\bClient\s*Id\s*:\s*([A-Z0-9]{4,})/gi;
+const BO_ID_LEARN_RE = /\b(?:BO\s*ID|DPID)\s*:\s*([A-Z0-9]{16})\b/gi;
+const CAS_ID_LEARN_RE = /\b(?:CAS|NSDL)\s*ID\s*:\s*([A-Z0-9]{4,})/gi;
+const OWNER_PAN_RE = /^(.+?)\s*\(\s*PAN\s*:/i;
+const ID_MARKER_RE = /^\s*(?:CAS|NSDL)\s*ID\s*:/i;
+/** Any 16-character BO ID shape: 16 digits (CDSL) or IN + 14 digits (NSDL). */
+const BO_ID_SHAPE_RE = /\b(?:\d{16}|IN\d{14})\b/g;
+/** A labelled depository-identifier row; dropped wherever it appears. */
+const DEPOSITORY_ID_LABEL_RE = /\b(?:DP\s*Name|DP\s*Id|Client\s*Id|BO\s*ID|DPID|CAS\s*ID|NSDL\s*ID)\s*:/i;
+
+interface LearntValue {
+  value: string;
+  token: string;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Every DP ID, Client ID, BO ID, CAS ID and investor name the statement prints. */
+export function learnDepositoryIdentifiers(doc: ExtractedDocument): LearntValue[] {
+  const found = new Map<string, string>();
+  const add = (value: string | undefined, token: string) => {
+    const v = value?.trim();
+    if (v && v.length >= 4 && !found.has(v)) found.set(v, token);
+  };
+  for (const page of doc.pages) {
+    page.rows.forEach((row, i) => {
+      const t = row.text;
+      for (const m of t.matchAll(BO_ID_LEARN_RE)) {
+        add(m[1], "[BO_ID]");
+        add(m[1].slice(0, 8), "[DP_ID]");
+        add(m[1].slice(8), "[CLIENT_ID]");
+      }
+      for (const m of t.matchAll(DP_ID_LEARN_RE)) add(m[1], "[DP_ID]");
+      for (const m of t.matchAll(CLIENT_ID_LEARN_RE)) add(m[1], "[CLIENT_ID]");
+      for (const m of t.matchAll(CAS_ID_LEARN_RE)) add(m[1], "[CAS_ID]");
+      for (const cell of row.cells) {
+        const owner = OWNER_PAN_RE.exec(cell.text);
+        if (owner) add(owner[1], "[NAME]");
+      }
+      if (ID_MARKER_RE.test(row.cells[0]?.text ?? "")) {
+        const next = page.rows[i + 1]?.cells[0]?.text;
+        if (next && !/[:\d]/.test(next)) add(next, "[NAME]");
+      }
+    });
+  }
+  // Longest first, so a BO ID is replaced whole before its DP ID half.
+  return [...found].map(([value, token]) => ({ value, token })).sort((a, b) => b.value.length - a.value.length);
+}
+
+function redactLearnt(text: string, learnt: readonly LearntValue[], redacted: string[]): string {
+  let out = text;
+  for (const { value, token } of learnt) {
+    const re = new RegExp(`(?<![A-Za-z0-9])${escapeRe(value)}(?![A-Za-z0-9])`, "gi");
+    out = out.replace(re, (m) => {
+      redacted.push(m);
+      return token;
+    });
+  }
+  return out.replace(BO_ID_SHAPE_RE, (m) => {
+    redacted.push(m);
+    return "[BO_ID]";
+  });
+}
+
+function redactDepositoryRow(row: TextRow, learnt: readonly LearntValue[], redacted: string[]): TextRow | null {
+  if (DEPOSITORY_ID_LABEL_RE.test(row.text)) return null;
+  const cells = row.cells
+    .map((c) => ({ ...c, text: redactLearnt(c.text, learnt, redacted) }))
+    // A cell that was nothing but an identifier (a page banner with the
+    // investor's name) goes, so it cannot be joined into a wrapped name.
+    .filter((c) => !/^(?:\[[A-Z_]+\]\s*)+$/.test(c.text.trim()));
+  return cells.length ? makeRow(row.y, cells) : null;
 }
 
 function makeRow(y: number, cells: TextCell[]): TextRow {
@@ -101,8 +206,14 @@ function redactRow(row: TextRow, redacted: string[]): TextRow {
   return makeRow(row.y, cells);
 }
 
-function scrubPage(page: ExtractedPage, headerSeenBefore: boolean, redacted: string[]): { page: ExtractedPage; headerSeen: boolean } {
-  const headerIdx = page.rows.findIndex(isTableHeaderRow);
+function scrubPage(
+  page: ExtractedPage,
+  headerSeenBefore: boolean,
+  redacted: string[],
+  isHeader: (row: TextRow) => boolean,
+  preRedact: ((row: TextRow) => TextRow | null) | null,
+): { page: ExtractedPage; headerSeen: boolean } {
+  const headerIdx = page.rows.findIndex(isHeader);
   // A page with no header is preamble until the first table has been seen,
   // and a table continuation afterwards.
   const keepFrom = headerIdx >= 0 ? headerIdx : headerSeenBefore ? 0 : page.rows.length;
@@ -111,6 +222,7 @@ function scrubPage(page: ExtractedPage, headerSeenBefore: boolean, redacted: str
   page.rows.forEach((row, i) => {
     let candidate: TextRow | null = row;
     if (i < keepFrom) candidate = keepAsOnCells(row);
+    if (candidate && preRedact) candidate = preRedact(candidate);
     if (!candidate) return;
     if (isPiiLabelRow(candidate.text)) return;
     const clean = redactRow(candidate, redacted);
@@ -130,15 +242,21 @@ export function scrubRows(
   doc: ExtractedDocument,
   detectedSource: StatementSource,
 ): { doc: ExtractedDocument; redacted: string[] } {
-  void detectedSource; // same rules for every PDF source today; kept for per-source rules later
+  const isHeader = headerPredicate(detectedSource);
   const redacted: string[] = [];
+  // Depository statements (D-051): learn the account identifiers and the
+  // investor's name from every page first, redact them in every surviving
+  // row, and hand all of them to the leak assertion even if no copy survived.
+  const learnt = detectedSource === "depository" ? learnDepositoryIdentifiers(doc) : [];
+  const preRedact = detectedSource === "depository" ? (row: TextRow) => redactDepositoryRow(row, learnt, redacted) : null;
   const pages: ExtractedPage[] = [];
   let headerSeen = false;
   for (const page of doc.pages) {
-    const out = scrubPage(page, headerSeen, redacted);
+    const out = scrubPage(page, headerSeen, redacted, isHeader, preRedact);
     headerSeen = out.headerSeen;
     pages.push(out.page);
   }
+  for (const { value } of learnt) redacted.push(value);
   return { doc: { pages }, redacted };
 }
 

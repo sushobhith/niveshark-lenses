@@ -35,7 +35,7 @@ export interface ExtractedDocument {
 // Parsing (D-025)
 // ---------------------------------------------------------------------------
 
-export type StatementSource = "mfcentral" | "cams" | "zerodha";
+export type StatementSource = "mfcentral" | "cams" | "zerodha" | "depository";
 
 export type ClientAssetType = "mutual_fund" | "etf" | "equity";
 export type ClientHoldingMode = "soa" | "demat";
