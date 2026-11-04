@@ -1,0 +1,14 @@
+{
+  "name": "niveshark-lenses",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Niveshark's deterministic portfolio lenses and statement scrubber",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test scrub/*.test.ts"
+  }
+}
