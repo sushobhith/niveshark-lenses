@@ -312,7 +312,7 @@ def analyze_tax(portfolio: Portfolio) -> TaxResult:
     for regime, items in regime_data.items():
         total_value = sum(mv for _, mv, _ in items)
         total_invested = sum(iv for _, _, iv in items)
-        gains = sum(mv - iv for _, mv, iv in items if mv > iv and iv > 0)
+        gains = sum(mv - iv for _, mv, iv in items if mv > iv > 0)
         losses = sum(iv - mv for _, mv, iv in items if mv < iv and iv > 0)
         net = gains - losses
 
